@@ -1,0 +1,7 @@
+# Ignore local database and environment files
+backend/inventory.db
+.env
+
+# Ignore node modules and build distributions
+frontend/node_modules/
+frontend/dist/
