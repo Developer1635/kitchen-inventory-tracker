@@ -1,9 +1,19 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date, timedelta
 import sqlite3
+import os
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Initialize the official Google GenAI client
+ai_client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 app = FastAPI()
 
@@ -49,9 +59,12 @@ class ItemCreate(BaseModel):
     category: Optional[str] = None
     purchase_date: Optional[date] = None
 
+class StallSetupRequest(BaseModel):
+    description: str
+
+# Fallback smart classification helper if AI is not used
 def smart_classify_item(name: str):
     name_lower = name.lower()
-    
     if any(k in name_lower for k in ["milk", "paneer", "curd", "butter", "cheese", "cream", "malai", "yogurt"]):
         return "Dairy", 1
     elif any(k in name_lower for k in ["fruit", "apple", "banana", "mango", "orange", "grapes", "papaya", "watermelon", "pomegranate", "guava", "pineapple", "strawberry", "tomato", "onion", "potato", "lemon", "mint", "coriander", "veg", "chili", "garlic", "ginger"]):
@@ -149,3 +162,29 @@ def delete_item(item_id: int):
     conn.commit()
     conn.close()
     return {"message": "Item deleted successfully"}
+
+# --- PHASE 1: GEMINI API DYNAMIC STALL ONBOARDING ENDPOINT ---
+@app.post("/api/setup-stall")
+def setup_stall(payload: StallSetupRequest):
+    if not ai_client:
+        raise HTTPException(status_code=500, detail="Gemini API Key is missing or invalid.")
+    
+    prompt = f"""
+    Analyze the following food stall or business description and generate a custom inventory configuration profile:
+    Description: "{payload.description}"
+    
+    Provide custom categories, typical shelf lives in days for those categories, and common ingredients or items expected for this type of stall.
+    """
+
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        return {"stall_profile": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
