@@ -12,7 +12,6 @@ from google.genai import types
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize the official Google GenAI client
 ai_client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 app = FastAPI()
@@ -59,18 +58,26 @@ class ItemCreate(BaseModel):
     category: Optional[str] = None
     purchase_date: Optional[date] = None
 
+class BatchItemCreate(BaseModel):
+    items: List[ItemCreate]
+
 class StallSetupRequest(BaseModel):
     description: str
 
-# Fallback smart classification helper if AI is not used
+class IngredientPromptRequest(BaseModel):
+    stall_type: str
+    category_name: str
+    audience_size: str
+    last_stocked_date: str
+
 def smart_classify_item(name: str):
     name_lower = name.lower()
     if any(k in name_lower for k in ["milk", "paneer", "curd", "butter", "cheese", "cream", "malai", "yogurt"]):
         return "Dairy", 1
     elif any(k in name_lower for k in ["fruit", "apple", "banana", "mango", "orange", "grapes", "papaya", "watermelon", "pomegranate", "guava", "pineapple", "strawberry", "tomato", "onion", "potato", "lemon", "mint", "coriander", "veg", "chili", "garlic", "ginger"]):
         return "Fruits & Vegetables", 2
-    elif any(k in name_lower for k in ["bread", "bun", "pav", "toast", "pastry", "puff"]):
-        return "Bakery", 3
+    elif any(k in name_lower for k in ["bread", "bun", "pav", "toast", "pastry", "puff", "cake", "pastries", "noodles", "pasta", "rice"]):
+        return "Bakery & Dry Goods", 5
     elif any(k in name_lower for k in ["chicken", "mutton", "egg", "fish", "patty", "meat", "marrow", "bone", "beef", "pork"]):
         return "Meat", 2
     else:
@@ -128,31 +135,25 @@ def create_item(item: ItemCreate):
     )
     conn.commit()
     conn.close()
-    return {"message": "Item added successfully with smart purchase tracking!"}
+    return {"message": "Item added successfully!"}
 
-@app.put("/items/{item_id}")
-def update_item(item_id: int, item: ItemCreate):
+@app.post("/items/batch")
+def create_batch_items(batch: BatchItemCreate):
     conn = get_db()
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM items WHERE id = ?", (item_id,))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Item not found")
+    for item in batch.items:
+        detected_category, default_days = smart_classify_item(item.name)
+        final_category = item.category if item.category else detected_category
+        p_date = item.purchase_date if item.purchase_date else date.today()
+        final_expiry = p_date + timedelta(days=default_days)
 
-    detected_category, default_days = smart_classify_item(item.name)
-    final_category = item.category if item.category else detected_category
-    
-    p_date = item.purchase_date if item.purchase_date else date.today()
-    final_expiry = p_date + timedelta(days=default_days)
-
-    cursor.execute(
-        "UPDATE items SET name = ?, category = ?, quantity = ?, unit = ?, purchase_date = ?, expiry_date = ? WHERE id = ?",
-        (item.name, final_category, item.quantity, item.unit, p_date.isoformat(), final_expiry.isoformat(), item_id)
-    )
+        cursor.execute(
+            "INSERT INTO items (name, category, quantity, unit, purchase_date, expiry_date) VALUES (?, ?, ?, ?, ?, ?)",
+            (item.name, final_category, item.quantity, item.unit, p_date.isoformat(), final_expiry.isoformat())
+        )
     conn.commit()
     conn.close()
-    return {"message": "Item updated successfully"}
+    return {"message": "Batch items added successfully!"}
 
 @app.delete("/items/{item_id}")
 def delete_item(item_id: int):
@@ -163,25 +164,65 @@ def delete_item(item_id: int):
     conn.close()
     return {"message": "Item deleted successfully"}
 
-# --- PHASE 1: GEMINI API DYNAMIC STALL ONBOARDING ENDPOINT ---
 @app.post("/api/setup-stall")
 def setup_stall(payload: StallSetupRequest):
     if not ai_client:
-        raise HTTPException(status_code=500, detail="Gemini API Key is missing or invalid.")
+        raise HTTPException(status_code=500, detail="Gemini API Key missing.")
     
     prompt = f"""
-    Analyze the following food stall or business description and generate a custom inventory configuration profile:
+    Analyze this food stall description and output a strict JSON object with these exact keys:
+    "stall_type": string,
+    "categories": [
+       {{ "category_name": string, "typical_shelf_days": number, "storage_conditions": string }}
+    ]
     Description: "{payload.description}"
-    
-    Provide custom categories, typical shelf lives in days for those categories, and common ingredients or items expected for this type of stall.
     """
 
-    try:
-        response = ai_client.models.generate_content(
-            model='gemini-3.5-flash-lite',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2,
-            ),
-        )
+    models_to_try = ['gemini-2.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash']
+    last_error = None
+
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            return {"stall_profile": response.text}
+        except Exception as e:
+            last_error = e
+            continue
+            
+    raise HTTPException(status_code=500, detail=f"All models failed: {str(last_error)}")
+
+@app.post("/api/suggest-ingredients")
+def suggest_ingredients(payload: IngredientPromptRequest):
+    if not ai_client:
+        raise HTTPException(status_code=500, detail="Gemini API Key missing.")
+    
+    prompt = f"""
+    For a '{payload.stall_type}' stall focusing on category '{payload.category_name}', with an expected audience size of '{payload.audience_size}' and last stocked on '{payload.last_stocked_date}', suggest 4-5 common required ingredients in strict JSON format with this exact structure:
+    [
+      {{ "name": "string", "default_quantity": number, "unit": "kg" or "liters" or "packets" or "units" }}
+    ]
+    """
+
+    models_to_try = ['gemini-2.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash']
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
+            )
+            return {"ingredients": response.text}
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=500, detail="Failed to generate ingredients.")
