@@ -178,13 +178,10 @@ def setup_stall(payload: StallSetupRequest):
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.2,
             ),
         )
-        return {"stall_profile": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
